@@ -21,3 +21,6 @@ export * from "./tags";
 // Components
 export * from "./folk-shape";
 export * from "./folk-markdown";
+
+// Sync
+export * from "./community-sync";

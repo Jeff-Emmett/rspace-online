@@ -4,9 +4,12 @@ import {
 	communityExists,
 	createCommunity,
 	deleteShape,
+	generateSyncMessageForPeer,
+	getDocumentData,
 	loadCommunity,
+	receiveSyncMessage,
+	removePeerSyncState,
 	updateShape,
-	type CommunityDoc,
 } from "./community-store";
 
 const PORT = Number(process.env.PORT) || 3000;
@@ -15,22 +18,20 @@ const DIST_DIR = resolve(import.meta.dir, "../dist");
 // WebSocket data type
 interface WSData {
 	communitySlug: string;
+	peerId: string;
 }
 
-// Track connected clients per community
-const communityClients = new Map<string, Set<ServerWebSocket<WSData>>>();
+// Track connected clients per community (for broadcasting)
+const communityClients = new Map<string, Map<string, ServerWebSocket<WSData>>>();
 
-// Helper to broadcast to all clients in a community
-function broadcastToCommunity(slug: string, message: object, excludeWs?: ServerWebSocket<WSData>) {
-	const clients = communityClients.get(slug);
-	if (!clients) return;
+// Generate unique peer ID
+function generatePeerId(): string {
+	return `peer-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+}
 
-	const data = JSON.stringify(message);
-	for (const client of clients) {
-		if (client !== excludeWs && client.readyState === WebSocket.OPEN) {
-			client.send(data);
-		}
-	}
+// Helper to get client by peer ID
+function getClient(slug: string, peerId: string): ServerWebSocket<WSData> | undefined {
+	return communityClients.get(slug)?.get(peerId);
 }
 
 // Parse subdomain from host header
@@ -91,7 +92,10 @@ const server = Bun.serve<WSData>({
 		if (url.pathname.startsWith("/ws/")) {
 			const communitySlug = url.pathname.split("/")[2];
 			if (communitySlug) {
-				const upgraded = server.upgrade(req, { data: { communitySlug } });
+				const peerId = generatePeerId();
+				const upgraded = server.upgrade(req, {
+					data: { communitySlug, peerId },
+				});
 				if (upgraded) return undefined;
 			}
 			return new Response("WebSocket upgrade failed", { status: 400 });
@@ -134,61 +138,131 @@ const server = Bun.serve<WSData>({
 
 	websocket: {
 		open(ws: ServerWebSocket<WSData>) {
-			const { communitySlug } = ws.data;
+			const { communitySlug, peerId } = ws.data;
 
-			// Add to clients set
+			// Add to clients map
 			if (!communityClients.has(communitySlug)) {
-				communityClients.set(communitySlug, new Set());
+				communityClients.set(communitySlug, new Map());
 			}
-			communityClients.get(communitySlug)!.add(ws);
+			communityClients.get(communitySlug)!.set(peerId, ws);
 
-			console.log(`Client connected to ${communitySlug}`);
+			console.log(`[WS] Client ${peerId} connected to ${communitySlug}`);
 
-			// Send current state
+			// Load community and send initial sync message
 			loadCommunity(communitySlug).then((doc) => {
 				if (doc) {
-					ws.send(JSON.stringify({ type: "sync", shapes: doc.shapes }));
+					const syncMessage = generateSyncMessageForPeer(communitySlug, peerId);
+					if (syncMessage) {
+						ws.send(
+							JSON.stringify({
+								type: "sync",
+								data: Array.from(syncMessage),
+							})
+						);
+					}
 				}
 			});
 		},
 
 		message(ws: ServerWebSocket<WSData>, message: string | Buffer) {
-			const { communitySlug } = ws.data;
+			const { communitySlug, peerId } = ws.data;
 
 			try {
-				const data = JSON.parse(message.toString());
+				const msg = JSON.parse(message.toString());
 
-				if (data.type === "update" && data.id && data.data) {
-					// Update local store
-					updateShape(communitySlug, data.id, data.data);
+				if (msg.type === "sync" && Array.isArray(msg.data)) {
+					// Handle Automerge sync message
+					const syncMessage = new Uint8Array(msg.data);
+					const result = receiveSyncMessage(communitySlug, peerId, syncMessage);
 
+					// Send response to this peer
+					if (result.response) {
+						ws.send(
+							JSON.stringify({
+								type: "sync",
+								data: Array.from(result.response),
+							})
+						);
+					}
+
+					// Broadcast to other peers
+					for (const [targetPeerId, targetMessage] of result.broadcastToPeers) {
+						const targetClient = getClient(communitySlug, targetPeerId);
+						if (targetClient && targetClient.readyState === WebSocket.OPEN) {
+							targetClient.send(
+								JSON.stringify({
+									type: "sync",
+									data: Array.from(targetMessage),
+								})
+							);
+						}
+					}
+				} else if (msg.type === "ping") {
+					// Handle keep-alive ping
+					ws.send(JSON.stringify({ type: "pong", timestamp: msg.timestamp }));
+				} else if (msg.type === "presence") {
+					// Broadcast presence to other clients
+					const clients = communityClients.get(communitySlug);
+					if (clients) {
+						const presenceMsg = JSON.stringify({
+							type: "presence",
+							peerId,
+							...msg,
+						});
+						for (const [clientPeerId, client] of clients) {
+							if (clientPeerId !== peerId && client.readyState === WebSocket.OPEN) {
+								client.send(presenceMsg);
+							}
+						}
+					}
+				}
+				// Legacy message handling for backward compatibility
+				else if (msg.type === "update" && msg.id && msg.data) {
+					updateShape(communitySlug, msg.id, msg.data);
 					// Broadcast to other clients
-					broadcastToCommunity(communitySlug, data, ws);
-				} else if (data.type === "delete" && data.id) {
-					// Delete from store
-					deleteShape(communitySlug, data.id);
-
+					const clients = communityClients.get(communitySlug);
+					if (clients) {
+						const updateMsg = JSON.stringify(msg);
+						for (const [clientPeerId, client] of clients) {
+							if (clientPeerId !== peerId && client.readyState === WebSocket.OPEN) {
+								client.send(updateMsg);
+							}
+						}
+					}
+				} else if (msg.type === "delete" && msg.id) {
+					deleteShape(communitySlug, msg.id);
 					// Broadcast to other clients
-					broadcastToCommunity(communitySlug, data, ws);
+					const clients = communityClients.get(communitySlug);
+					if (clients) {
+						const deleteMsg = JSON.stringify(msg);
+						for (const [clientPeerId, client] of clients) {
+							if (clientPeerId !== peerId && client.readyState === WebSocket.OPEN) {
+								client.send(deleteMsg);
+							}
+						}
+					}
 				}
 			} catch (e) {
-				console.error("Failed to parse WebSocket message:", e);
+				console.error("[WS] Failed to parse message:", e);
 			}
 		},
 
 		close(ws: ServerWebSocket<WSData>) {
-			const { communitySlug } = ws.data;
+			const { communitySlug, peerId } = ws.data;
 
-			// Remove from clients set
+			// Remove from clients map
 			const clients = communityClients.get(communitySlug);
 			if (clients) {
-				clients.delete(ws);
+				clients.delete(peerId);
 				if (clients.size === 0) {
 					communityClients.delete(communitySlug);
 				}
 			}
 
-			console.log(`Client disconnected from ${communitySlug}`);
+			// Clean up peer sync state
+			removePeerSyncState(communitySlug, peerId);
+
+			console.log(`[WS] Client ${peerId} disconnected from ${communitySlug}`);
 		},
 	},
 });
@@ -212,20 +286,26 @@ async function handleAPI(req: Request, url: URL): Promise<Response> {
 			const { name, slug } = body;
 
 			if (!name || !slug) {
-				return Response.json({ error: "Name and slug are required" }, { status: 400, headers: corsHeaders });
+				return Response.json(
+					{ error: "Name and slug are required" },
+					{ status: 400, headers: corsHeaders }
+				);
 			}
 
 			// Validate slug format
 			if (!/^[a-z0-9-]+$/.test(slug)) {
 				return Response.json(
 					{ error: "Slug must contain only lowercase letters, numbers, and hyphens" },
-					{ status: 400, headers: corsHeaders },
+					{ status: 400, headers: corsHeaders }
 				);
 			}
 
 			// Check if exists
 			if (await communityExists(slug)) {
-				return Response.json({ error: "Community already exists" }, { status: 409, headers: corsHeaders });
+				return Response.json(
+					{ error: "Community already exists" },
+					{ status: 409, headers: corsHeaders }
+				);
 			}
 
 			// Create community
@@ -234,24 +314,36 @@ async function handleAPI(req: Request, url: URL): Promise<Response> {
 			// Return URL to new community
 			return Response.json(
 				{ url: `https://${slug}.rspace.online`, slug, name },
-				{ headers: corsHeaders },
+				{ headers: corsHeaders }
 			);
 		} catch (e) {
 			console.error("Failed to create community:", e);
-			return Response.json({ error: "Failed to create community" }, { status: 500, headers: corsHeaders });
+			return Response.json(
+				{ error: "Failed to create community" },
+				{ status: 500, headers: corsHeaders }
+			);
 		}
 	}
 
 	// GET /api/communities/:slug - Get community info
 	if (url.pathname.startsWith("/api/communities/") && req.method === "GET") {
 		const slug = url.pathname.split("/")[3];
-		const community = await loadCommunity(slug);
+		const data = getDocumentData(slug);
 
-		if (!community) {
-			return Response.json({ error: "Community not found" }, { status: 404, headers: corsHeaders });
+		if (!data) {
+			// Try loading from disk
+			await loadCommunity(slug);
+			const loadedData = getDocumentData(slug);
+			if (!loadedData) {
+				return Response.json(
+					{ error: "Community not found" },
+					{ status: 404, headers: corsHeaders }
+				);
+			}
+			return Response.json({ meta: loadedData.meta }, { headers: corsHeaders });
 		}
 
-		return Response.json({ meta: community.meta }, { headers: corsHeaders });
+		return Response.json({ meta: data.meta }, { headers: corsHeaders });
 	}
 
 	return Response.json({ error: "Not found" }, { status: 404, headers: corsHeaders });

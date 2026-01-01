@@ -84,14 +84,34 @@
 				font-size: 12px;
 				color: #64748b;
 				z-index: 1000;
+				display: flex;
+				align-items: center;
+				gap: 8px;
 			}
 
-			#status.connected {
-				color: #22c55e;
+			#status .indicator {
+				width: 8px;
+				height: 8px;
+				border-radius: 50%;
+				background: #64748b;
 			}
 
-			#status.disconnected {
-				color: #ef4444;
+			#status.connected .indicator {
+				background: #22c55e;
+			}
+
+			#status.disconnected .indicator {
+				background: #ef4444;
+			}
+
+			#status.syncing .indicator {
+				background: #f59e0b;
+				animation: pulse 1s infinite;
+			}
+
+			@keyframes pulse {
+				0%, 100% { opacity: 1; }
+				50% { opacity: 0.5; }
 			}
 
 			#canvas {
@@ -117,18 +137,21 @@
 		</div>
 
 		<div id="toolbar">
-			<button id="add-markdown" title="Add Markdown Note">📝 Add Note</button>
+			<button id="add-markdown" title="Add Markdown Note">+ Add Note</button>
 			<button id="zoom-in" title="Zoom In">+</button>
 			<button id="zoom-out" title="Zoom Out">-</button>
-			<button id="reset-view" title="Reset View">⌂</button>
+			<button id="reset-view" title="Reset View">Reset</button>
 		</div>
 
-		<div id="status" class="disconnected">Connecting...</div>
+		<div id="status" class="disconnected">
+			<span class="indicator"></span>
+			<span id="status-text">Connecting...</span>
+		</div>
 
 		<div id="canvas"></div>
 
 		<script type="module">
-			import { FolkShape, FolkMarkdown } from "@lib";
+			import { FolkShape, FolkMarkdown, CommunitySync } from "@lib";
 
 			// Register custom elements
 			FolkShape.define();
@@ -146,110 +169,98 @@
 
 			const canvas = document.getElementById("canvas");
 			const status = document.getElementById("status");
+			const statusText = document.getElementById("status-text");
 			let shapeCounter = 0;
 
-			// WebSocket connection for sync
-			let ws = null;
-			let reconnectAttempts = 0;
-			const maxReconnectAttempts = 5;
+			// Initialize CommunitySync
+			const sync = new CommunitySync(communitySlug);
 
-			function connectWebSocket() {
-				const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-				const wsUrl = `${protocol}//${window.location.host}/ws/${communitySlug}`;
+			// Track if we're processing remote changes to avoid feedback loops
+			let isProcessingRemote = false;
 
-				try {
-					ws = new WebSocket(wsUrl);
+			// Handle connection status
+			sync.addEventListener("connected", () => {
+				status.className = "connected";
+				statusText.textContent = "Connected";
+			});
 
-					ws.onopen = () => {
-						status.textContent = "Connected";
-						status.className = "connected";
-						reconnectAttempts = 0;
-					};
+			sync.addEventListener("disconnected", () => {
+				status.className = "disconnected";
+				statusText.textContent = "Reconnecting...";
+			});
 
-					ws.onmessage = (event) => {
-						try {
-							const data = JSON.parse(event.data);
-							handleSyncMessage(data);
-						} catch (e) {
-							console.error("Failed to parse message:", e);
-						}
-					};
+			sync.addEventListener("synced", (e) => {
+				console.log("[Canvas] Initial sync complete:", e.detail.shapes);
+			});
 
-					ws.onclose = () => {
-						status.textContent = "Disconnected";
-						status.className = "disconnected";
+			// Handle shape creation from remote
+			sync.addEventListener("create-shape", (e) => {
+				const data = e.detail;
 
-						if (reconnectAttempts < maxReconnectAttempts) {
-							reconnectAttempts++;
-							setTimeout(connectWebSocket, 2000 * reconnectAttempts);
-						}
-					};
-
-					ws.onerror = (error) => {
-						console.error("WebSocket error:", error);
-					};
-				} catch (e) {
-					console.error("Failed to connect WebSocket:", e);
-					status.textContent = "Offline Mode";
+				// Check if shape already exists
+				if (document.getElementById(data.id)) {
+					return;
 				}
-			}
 
-			function handleSyncMessage(data) {
-				if (data.type === "sync") {
-					// Full state sync
-					Object.entries(data.shapes).forEach(([id, shapeData]) => {
-						let shape = document.getElementById(id);
-						if (!shape) {
-							shape = createShape(shapeData);
-							shape.id = id;
-							canvas.appendChild(shape);
-						}
-						updateShapeFromData(shape, shapeData);
-					});
-				} else if (data.type === "update") {
-					// Incremental update
-					let shape = document.getElementById(data.id);
-					if (!shape && data.data) {
-						shape = createShape(data.data);
-						shape.id = data.id;
-						canvas.appendChild(shape);
-					} else if (shape && data.data) {
-						updateShapeFromData(shape, data.data);
-					}
-				} else if (data.type === "delete") {
-					const shape = document.getElementById(data.id);
-					if (shape) shape.remove();
+				isProcessingRemote = true;
+				const shape = createShapeElement(data);
+				setupShapeEventListeners(shape);
+				canvas.appendChild(shape);
+				sync.registerShape(shape);
+				isProcessingRemote = false;
+			});
+
+			// Handle shape deletion from remote
+			sync.addEventListener("shape-deleted", (e) => {
+				const { shapeId, shape } = e.detail;
+				if (shape && shape.parentNode) {
+					shape.remove();
 				}
-			}
+			});
 
-			function createShape(data) {
-				const shape = document.createElement("folk-markdown");
+			// Create a shape element from data
+			function createShapeElement(data) {
+				let shape;
+
+				switch (data.type) {
+					case "folk-markdown":
+					default:
+						shape = document.createElement("folk-markdown");
+						if (data.content) shape.content = data.content;
+						break;
+				}
+
+				shape.id = data.id;
 				shape.x = data.x || 100;
 				shape.y = data.y || 100;
 				shape.width = data.width || 300;
 				shape.height = data.height || 200;
-				if (data.content) shape.content = data.content;
+				if (data.rotation) shape.rotation = data.rotation;
+
 				return shape;
 			}
 
-			function updateShapeFromData(shape, data) {
-				if (data.x !== undefined) shape.x = data.x;
-				if (data.y !== undefined) shape.y = data.y;
-				if (data.width !== undefined) shape.width = data.width;
-				if (data.height !== undefined) shape.height = data.height;
-				if (data.content !== undefined) shape.content = data.content;
-			}
+			// Setup event listeners for shape
+			function setupShapeEventListeners(shape) {
+				// Transform events (move, resize, rotate)
+				shape.addEventListener("folk-transform", (e) => {
+					if (!isProcessingRemote) {
+						// Already handled by CommunitySync registration
+					}
+				});
 
-			function broadcastUpdate(shape) {
-				if (ws && ws.readyState === WebSocket.OPEN) {
-					ws.send(
-						JSON.stringify({
-							type: "update",
-							id: shape.id,
-							data: shape.toJSON(),
-						})
-					);
-				}
+				// Content change events (for markdown)
+				shape.addEventListener("content-change", (e) => {
+					if (!isProcessingRemote) {
+						// Already handled by CommunitySync registration
+					}
+				});
+
+				// Close button
+				shape.addEventListener("close", () => {
+					sync.deleteShape(shape.id);
+					shape.remove();
+				});
 			}
 
 			// Add markdown note button
@@ -263,40 +274,47 @@
 				shape.height = 200;
 				shape.content = "# New Note\n\nStart typing...";
 
-				shape.addEventListener("transform", () => {
-					broadcastUpdate(shape);
-				});
-
-				shape.addEventListener("content-change", () => {
-					broadcastUpdate(shape);
-				});
-
-				shape.addEventListener("close", () => {
-					shape.remove();
-					if (ws && ws.readyState === WebSocket.OPEN) {
-						ws.send(JSON.stringify({ type: "delete", id: shape.id }));
-					}
-				});
-
+				setupShapeEventListeners(shape);
 				canvas.appendChild(shape);
-				broadcastUpdate(shape);
+				sync.registerShape(shape);
 			});
 
-			// Zoom controls (placeholder)
+			// Zoom controls
+			let scale = 1;
+			const minScale = 0.25;
+			const maxScale = 4;
+
 			document.getElementById("zoom-in").addEventListener("click", () => {
-				console.log("Zoom in - to be implemented");
+				scale = Math.min(scale * 1.25, maxScale);
+				canvas.style.transform = `scale(${scale})`;
+				canvas.style.transformOrigin = "center center";
 			});
 
 			document.getElementById("zoom-out").addEventListener("click", () => {
-				console.log("Zoom out - to be implemented");
+				scale = Math.max(scale / 1.25, minScale);
+				canvas.style.transform = `scale(${scale})`;
+				canvas.style.transformOrigin = "center center";
 			});
 
 			document.getElementById("reset-view").addEventListener("click", () => {
-				console.log("Reset view - to be implemented");
+				scale = 1;
+				canvas.style.transform = "scale(1)";
 			});
 
-			// Initialize
-			connectWebSocket();
+			// Keep-alive ping
+			setInterval(() => {
+				if (sync.doc) {
+					// Sync is connected, nothing to do
+				}
+			}, 30000);
+
+			// Connect to server
+			const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+			const wsUrl = `${protocol}//${window.location.host}/ws/${communitySlug}`;
+			sync.connect(wsUrl);
+
+			// Debug: expose sync for console inspection
+			window.sync = sync;
 		</script>
 	</body>
 </html>

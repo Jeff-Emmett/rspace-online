@@ -1,8 +1,10 @@
 import { resolve } from "node:path";
 import { defineConfig } from "vite";
+import wasm from "vite-plugin-wasm";
 
 export default defineConfig({
 	root: "website",
+	plugins: [wasm()],
 	resolve: {
 		alias: {
 			"@lib": resolve(__dirname, "./lib"),
@@ -24,5 +26,8 @@ export default defineConfig({
 	},
 	server: {
 		port: 5173,
+	},
+	optimizeDeps: {
+		exclude: ["@automerge/automerge"],
 	},
 });
