@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<title>rSpace Canvas</title>
+		<style>
+			* {
+				margin: 0;
+				padding: 0;
+				box-sizing: border-box;
+			}
+
+			html,
+			body {
+				width: 100%;
+				height: 100%;
+				overflow: hidden;
+				font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+			}
+
+			#toolbar {
+				position: fixed;
+				top: 16px;
+				left: 50%;
+				transform: translateX(-50%);
+				display: flex;
+				gap: 8px;
+				padding: 8px 16px;
+				background: white;
+				border-radius: 12px;
+				box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
+				z-index: 1000;
+			}
+
+			#toolbar button {
+				padding: 8px 16px;
+				border: none;
+				border-radius: 8px;
+				background: #f1f5f9;
+				cursor: pointer;
+				font-size: 14px;
+				transition: background 0.2s;
+			}
+
+			#toolbar button:hover {
+				background: #e2e8f0;
+			}
+
+			#toolbar button.active {
+				background: #14b8a6;
+				color: white;
+			}
+
+			#community-info {
+				position: fixed;
+				top: 16px;
+				left: 16px;
+				padding: 8px 16px;
+				background: white;
+				border-radius: 8px;
+				box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+				z-index: 1000;
+			}
+
+			#community-info h2 {
+				font-size: 14px;
+				color: #0f172a;
+			}
+
+			#community-info p {
+				font-size: 12px;
+				color: #64748b;
+			}
+
+			#status {
+				position: fixed;
+				bottom: 16px;
+				right: 16px;
+				padding: 8px 16px;
+				background: white;
+				border-radius: 8px;
+				box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+				font-size: 12px;
+				color: #64748b;
+				z-index: 1000;
+			}
+
+			#status.connected {
+				color: #22c55e;
+			}
+
+			#status.disconnected {
+				color: #ef4444;
+			}
+
+			#canvas {
+				width: 100%;
+				height: 100%;
+				background: linear-gradient(#f1f5f9 1px, transparent 1px),
+					linear-gradient(90deg, #f1f5f9 1px, transparent 1px);
+				background-size: 20px 20px;
+				background-position: -1px -1px;
+				position: relative;
+				overflow: hidden;
+			}
+
+			folk-markdown {
+				position: absolute;
+			}
+		</style>
+	</head>
+	<body>
+		<div id="community-info">
+			<h2 id="community-name">Loading...</h2>
+			<p id="community-slug"></p>
+		</div>
+
+		<div id="toolbar">
+			<button id="add-markdown" title="Add Markdown Note">📝 Add Note</button>
+			<button id="zoom-in" title="Zoom In">+</button>
+			<button id="zoom-out" title="Zoom Out">-</button>
+			<button id="reset-view" title="Reset View">⌂</button>
+		</div>
+
+		<div id="status" class="disconnected">Connecting...</div>
+
+		<div id="canvas"></div>
+
+		<script type="module">
+			import { FolkShape, FolkMarkdown } from "@lib";
+
+			// Register custom elements
+			FolkShape.define();
+			FolkMarkdown.define();
+
+			// Get community info from URL
+			const hostname = window.location.hostname;
+			const subdomain = hostname.split(".")[0];
+			const isLocalhost = hostname === "localhost" || hostname === "127.0.0.1";
+			const communitySlug = isLocalhost ? "demo" : subdomain;
+
+			// Update UI
+			document.getElementById("community-name").textContent = communitySlug;
+			document.getElementById("community-slug").textContent = `${communitySlug}.rspace.online`;
+
+			const canvas = document.getElementById("canvas");
+			const status = document.getElementById("status");
+			let shapeCounter = 0;
+
+			// WebSocket connection for sync
+			let ws = null;
+			let reconnectAttempts = 0;
+			const maxReconnectAttempts = 5;
+
+			function connectWebSocket() {
+				const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+				const wsUrl = `${protocol}//${window.location.host}/ws/${communitySlug}`;
+
+				try {
+					ws = new WebSocket(wsUrl);
+
+					ws.onopen = () => {
+						status.textContent = "Connected";
+						status.className = "connected";
+						reconnectAttempts = 0;
+					};
+
+					ws.onmessage = (event) => {
+						try {
+							const data = JSON.parse(event.data);
+							handleSyncMessage(data);
+						} catch (e) {
+							console.error("Failed to parse message:", e);
+						}
+					};
+
+					ws.onclose = () => {
+						status.textContent = "Disconnected";
+						status.className = "disconnected";
+
+						if (reconnectAttempts < maxReconnectAttempts) {
+							reconnectAttempts++;
+							setTimeout(connectWebSocket, 2000 * reconnectAttempts);
+						}
+					};
+
+					ws.onerror = (error) => {
+						console.error("WebSocket error:", error);
+					};
+				} catch (e) {
+					console.error("Failed to connect WebSocket:", e);
+					status.textContent = "Offline Mode";
+				}
+			}
+
+			function handleSyncMessage(data) {
+				if (data.type === "sync") {
+					// Full state sync
+					Object.entries(data.shapes).forEach(([id, shapeData]) => {
+						let shape = document.getElementById(id);
+						if (!shape) {
+							shape = createShape(shapeData);
+							shape.id = id;
+							canvas.appendChild(shape);
+						}
+						updateShapeFromData(shape, shapeData);
+					});
+				} else if (data.type === "update") {
+					// Incremental update
+					let shape = document.getElementById(data.id);
+					if (!shape && data.data) {
+						shape = createShape(data.data);
+						shape.id = data.id;
+						canvas.appendChild(shape);
+					} else if (shape && data.data) {
+						updateShapeFromData(shape, data.data);
+					}
+				} else if (data.type === "delete") {
+					const shape = document.getElementById(data.id);
+					if (shape) shape.remove();
+				}
+			}
+
+			function createShape(data) {
+				const shape = document.createElement("folk-markdown");
+				shape.x = data.x || 100;
+				shape.y = data.y || 100;
+				shape.width = data.width || 300;
+				shape.height = data.height || 200;
+				if (data.content) shape.content = data.content;
+				return shape;
+			}
+
+			function updateShapeFromData(shape, data) {
+				if (data.x !== undefined) shape.x = data.x;
+				if (data.y !== undefined) shape.y = data.y;
+				if (data.width !== undefined) shape.width = data.width;
+				if (data.height !== undefined) shape.height = data.height;
+				if (data.content !== undefined) shape.content = data.content;
+			}
+
+			function broadcastUpdate(shape) {
+				if (ws && ws.readyState === WebSocket.OPEN) {
+					ws.send(
+						JSON.stringify({
+							type: "update",
+							id: shape.id,
+							data: shape.toJSON(),
+						})
+					);
+				}
+			}
+
+			// Add markdown note button
+			document.getElementById("add-markdown").addEventListener("click", () => {
+				const id = `shape-${Date.now()}-${++shapeCounter}`;
+				const shape = document.createElement("folk-markdown");
+				shape.id = id;
+				shape.x = 100 + Math.random() * 200;
+				shape.y = 100 + Math.random() * 200;
+				shape.width = 300;
+				shape.height = 200;
+				shape.content = "# New Note\n\nStart typing...";
+
+				shape.addEventListener("transform", () => {
+					broadcastUpdate(shape);
+				});
+
+				shape.addEventListener("content-change", () => {
+					broadcastUpdate(shape);
+				});
+
+				shape.addEventListener("close", () => {
+					shape.remove();
+					if (ws && ws.readyState === WebSocket.OPEN) {
+						ws.send(JSON.stringify({ type: "delete", id: shape.id }));
+					}
+				});
+
+				canvas.appendChild(shape);
+				broadcastUpdate(shape);
+			});
+
+			// Zoom controls (placeholder)
+			document.getElementById("zoom-in").addEventListener("click", () => {
+				console.log("Zoom in - to be implemented");
+			});
+
+			document.getElementById("zoom-out").addEventListener("click", () => {
+				console.log("Zoom out - to be implemented");
+			});
+
+			document.getElementById("reset-view").addEventListener("click", () => {
+				console.log("Reset view - to be implemented");
+			});
+
+			// Initialize
+			connectWebSocket();
+		</script>
+	</body>
+</html>

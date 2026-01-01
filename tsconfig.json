@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "isolatedModules": true,
+    "noEmit": true,
+    "strict": true,
+    "noFallthroughCasesInSwitch": true,
+    "allowImportingTsExtensions": true,
+    "useDefineForClassFields": false,
+    "experimentalDecorators": true,
+    "skipLibCheck": true,
+    "noUnusedLocals": false,
+    "lib": ["DOM", "DOM.Iterable", "ESNext"],
+    "types": ["@types/node", "bun-types"],
+    "baseUrl": ".",
+    "paths": {
+      "@lib": ["lib"],
+      "@lib/*": ["lib/*"]
+    }
+  },
+  "include": ["**/*.ts", "vite.config.ts"],
+  "exclude": ["node_modules/**/*", "dist/**/*"]
+}

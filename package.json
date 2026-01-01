@@ -1,0 +1,24 @@
+{
+  "name": "rspace-online",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "server": "bun run server/index.ts",
+    "start": "bun run build && bun run server"
+  },
+  "dependencies": {
+    "@automerge/automerge": "^2.2.8",
+    "@lit/reactive-element": "^2.0.4",
+    "perfect-arrows": "^0.3.7",
+    "perfect-freehand": "^1.2.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.1",
+    "bun-types": "^1.1.38",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.3"
+  }
+}

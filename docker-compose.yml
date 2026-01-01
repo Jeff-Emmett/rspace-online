@@ -1,0 +1,35 @@
+version: "3.8"
+
+services:
+  rspace:
+    build: .
+    container_name: rspace-online
+    restart: unless-stopped
+    volumes:
+      - rspace-data:/data/communities
+    environment:
+      - NODE_ENV=production
+      - STORAGE_DIR=/data/communities
+      - PORT=3000
+    labels:
+      - "traefik.enable=true"
+      # Main domain
+      - "traefik.http.routers.rspace.rule=Host(`rspace.online`) || Host(`www.rspace.online`)"
+      - "traefik.http.routers.rspace.entrypoints=websecure"
+      - "traefik.http.routers.rspace.tls=true"
+      # Wildcard subdomain routing
+      - "traefik.http.routers.rspace-wildcard.rule=HostRegexp(`{subdomain:[a-z0-9-]+}.rspace.online`)"
+      - "traefik.http.routers.rspace-wildcard.entrypoints=websecure"
+      - "traefik.http.routers.rspace-wildcard.tls=true"
+      # Service configuration
+      - "traefik.http.services.rspace.loadbalancer.server.port=3000"
+      - "traefik.docker.network=traefik-public"
+    networks:
+      - traefik-public
+
+volumes:
+  rspace-data:
+
+networks:
+  traefik-public:
+    external: true
